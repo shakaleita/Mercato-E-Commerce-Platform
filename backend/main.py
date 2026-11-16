@@ -47,6 +47,13 @@ class Product(BaseModel):
 class Checkout(BaseModel):
     product_id:int
     quantity:int = Field(gt=0, le=10000)
+    idempotency_key:str|None=Field(default=None,min_length=12,max_length=128)
+
+with db() as con:
+    cols={r['name'] for r in con.execute('PRAGMA table_info(orders)')}
+    if 'status' not in cols:con.execute("ALTER TABLE orders ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
+    if 'idempotency_key' not in cols:con.execute('ALTER TABLE orders ADD COLUMN idempotency_key TEXT')
+    con.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency ON orders(idempotency_key)')
 @app.get('/api/items')
 def items():
     with db() as c:return rows(c.execute('SELECT * FROM products ORDER BY id DESC'))
@@ -61,16 +68,23 @@ def checkout(o:Checkout):
     if o.quantity<=0:raise HTTPException(422,'Quantity must be positive')
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
+        if o.idempotency_key:
+            previous=c.execute('SELECT * FROM orders WHERE idempotency_key=?',(o.idempotency_key,)).fetchone()
+            if previous:
+                if previous['product_id']!=o.product_id or previous['quantity']!=o.quantity:
+                    raise HTTPException(409,'Idempotency key belongs to a different checkout')
+                stock=c.execute('SELECT stock FROM products WHERE id=?',(o.product_id,)).fetchone()
+                return {'order_id':previous['id'],'total':previous['total'],'status':previous['status'],'remaining_stock':stock['stock'],'replayed':True}
         p=c.execute('SELECT * FROM products WHERE id=?',(o.product_id,)).fetchone()
         if not p:raise HTTPException(404,'Product not found')
         if p['stock']<o.quantity:raise HTTPException(409,'Insufficient stock')
         c.execute('UPDATE products SET stock=stock-? WHERE id=?',(o.quantity,o.product_id))
         total=round(p['price']*o.quantity,2)
-        cur=c.execute('INSERT INTO orders(product_id,quantity,total) VALUES(?,?,?)',(o.product_id,o.quantity,total))
-        return {'order_id':cur.lastrowid,'total':total,'remaining_stock':p['stock']-o.quantity}
+        cur=c.execute('INSERT INTO orders(product_id,quantity,total,idempotency_key) VALUES(?,?,?,?)',(o.product_id,o.quantity,total,o.idempotency_key))
+        return {'order_id':cur.lastrowid,'total':total,'remaining_stock':p['stock']-o.quantity,'status':'completed','replayed':False}
 @app.get('/api/summary')
 def summary():
-    with db() as c:return [{'label':'Products','value':c.execute('SELECT COUNT(*) FROM products').fetchone()[0]},{'label':'Orders','value':c.execute('SELECT COUNT(*) FROM orders').fetchone()[0]},{'label':'Revenue','value':round(c.execute('SELECT COALESCE(SUM(total),0) FROM orders').fetchone()[0],2)}]
+    with db() as c:return [{'label':'Products','value':c.execute('SELECT COUNT(*) FROM products').fetchone()[0]},{'label':'Orders','value':c.execute('SELECT COUNT(*) FROM orders').fetchone()[0]},{'label':'Revenue','value':round(c.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE status='completed'").fetchone()[0],2)}]
 
 
 # v0.3: order lifecycle and inventory replenishment
@@ -91,6 +105,20 @@ def order_history(limit: int = 50):
         raise HTTPException(422, 'Limit must be between 1 and 200')
     with db() as con:
         return rows(con.execute("""SELECT o.id, o.product_id, p.name AS product,
-            o.quantity, o.total, o.created_at FROM orders o
+            o.quantity, o.total, o.created_at, o.status FROM orders o
             JOIN products p ON p.id=o.product_id ORDER BY o.id DESC LIMIT ?""",(limit,)))
 
+
+@app.post('/api/orders/{order_id}/cancel')
+def cancel_order(order_id:int):
+    with db() as con:
+        con.execute('BEGIN IMMEDIATE')
+        order=con.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
+        if not order:raise HTTPException(404,'Order not found')
+        if order['status']!='completed':raise HTTPException(409,'Order already cancelled')
+        con.execute("UPDATE orders SET status='cancelled' WHERE id=?",(order_id,))
+        con.execute('UPDATE products SET stock=stock+? WHERE id=?',(order['quantity'],order['product_id']))
+        return {'id':order_id,'status':'cancelled','restored':order['quantity']}
+
+from security import install_auth
+install_auth(app,DB)
