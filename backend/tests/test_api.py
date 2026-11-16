@@ -68,3 +68,29 @@ def test_v06_audit_record_and_cross_site_guard():
     assert client.get('/api/auth/audit',params={'limit':201}).status_code==422
     blocked=client.post('/api/__audit_probe_404',headers={'sec-fetch-site':'cross-site'})
     assert blocked.status_code==403
+
+
+def test_prices_calculated_in_integer_cents():
+    product=client.post('/api/items',json={'name':'Penny product','price':'0.29','stock':10}).json()
+    assert product['price_cents']==29
+    result=client.post('/api/checkout',json={'product_id':product['id'],'quantity':3,
+                                            'idempotency_key':'precise-cents-case-0001'})
+    assert result.status_code==200
+    assert result.json()['total_cents']==87
+    assert result.json()['total']==0.87
+    replay=client.post('/api/checkout',json={'product_id':product['id'],'quantity':3,
+                                            'idempotency_key':'precise-cents-case-0001'})
+    assert replay.json()['total_cents']==87
+    assert replay.json()['replayed'] is True
+    assert client.post('/api/items',json={'name':'Invalid rounding','price':'1.999','stock':5}).status_code==422
+
+
+def test_revenue_reflects_completed_orders_in_cents():
+    product=client.post('/api/items',json={'name':'Tiny','price':'0.01','stock':10}).json()
+    before={x['label']:x['value'] for x in client.get('/api/summary').json()}['Revenue']
+    order=client.post('/api/checkout',json={'product_id':product['id'],'quantity':7}).json()
+    after={x['label']:x['value'] for x in client.get('/api/summary').json()}['Revenue']
+    assert round(after-before,2)==0.07
+    assert client.post('/api/orders/'+str(order['order_id'])+'/cancel').status_code==200
+    final={x['label']:x['value'] for x in client.get('/api/summary').json()}['Revenue']
+    assert round(final-before,2)==0
