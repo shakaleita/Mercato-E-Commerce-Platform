@@ -2,6 +2,7 @@ APP_TITLE = 'Mercato'
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from decimal import Decimal
 from typing import Any
 import sqlite3, os
 from contextlib import contextmanager
@@ -42,7 +43,7 @@ CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY,product_id INTEGER NOT 
 class Product(BaseModel):
     name:str
     category:str="General"
-    price:float = Field(ge=0, allow_inf_nan=False)
+    price:Decimal = Field(ge=0, le=9999999, decimal_places=2)
     stock:int = Field(ge=0)
 class Checkout(BaseModel):
     product_id:int
@@ -54,14 +55,22 @@ with db() as con:
     if 'status' not in cols:con.execute("ALTER TABLE orders ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
     if 'idempotency_key' not in cols:con.execute('ALTER TABLE orders ADD COLUMN idempotency_key TEXT')
     con.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency ON orders(idempotency_key)')
+    product_cols={row['name'] for row in con.execute('PRAGMA table_info(products)')}
+    if 'price_cents' not in product_cols:
+        con.execute('ALTER TABLE products ADD COLUMN price_cents INTEGER')
+    con.execute('UPDATE products SET price_cents=CAST(ROUND(price * 100) AS INTEGER) WHERE price_cents IS NULL')
+    if 'total_cents' not in cols:
+        con.execute('ALTER TABLE orders ADD COLUMN total_cents INTEGER')
+    con.execute('UPDATE orders SET total_cents=CAST(ROUND(total * 100) AS INTEGER) WHERE total_cents IS NULL')
 @app.get('/api/items')
 def items():
     with db() as c:return rows(c.execute('SELECT * FROM products ORDER BY id DESC'))
 @app.post('/api/items',status_code=201)
 def create_item(p:Product):
     if not p.name.strip() or p.price<0 or p.stock<0:raise HTTPException(422,'Invalid product')
+    cents=int(p.price*100)
     with db() as c:
-        cur=c.execute('INSERT INTO products(name,category,price,stock) VALUES(?,?,?,?)',(p.name,p.category,p.price,p.stock))
+        cur=c.execute('INSERT INTO products(name,category,price,stock,price_cents) VALUES(?,?,?,?,?)',(p.name,p.category,float(p.price),p.stock,cents))
         return dict(c.execute('SELECT * FROM products WHERE id=?',(cur.lastrowid,)).fetchone())
 @app.post('/api/checkout')
 def checkout(o:Checkout):
@@ -74,17 +83,18 @@ def checkout(o:Checkout):
                 if previous['product_id']!=o.product_id or previous['quantity']!=o.quantity:
                     raise HTTPException(409,'Idempotency key belongs to a different checkout')
                 stock=c.execute('SELECT stock FROM products WHERE id=?',(o.product_id,)).fetchone()
-                return {'order_id':previous['id'],'total':previous['total'],'status':previous['status'],'remaining_stock':stock['stock'],'replayed':True}
+                return {'order_id':previous['id'],'total':previous['total_cents']/100,'total_cents':previous['total_cents'],'status':previous['status'],'remaining_stock':stock['stock'],'replayed':True}
         p=c.execute('SELECT * FROM products WHERE id=?',(o.product_id,)).fetchone()
         if not p:raise HTTPException(404,'Product not found')
         if p['stock']<o.quantity:raise HTTPException(409,'Insufficient stock')
         c.execute('UPDATE products SET stock=stock-? WHERE id=?',(o.quantity,o.product_id))
-        total=round(p['price']*o.quantity,2)
-        cur=c.execute('INSERT INTO orders(product_id,quantity,total,idempotency_key) VALUES(?,?,?,?)',(o.product_id,o.quantity,total,o.idempotency_key))
-        return {'order_id':cur.lastrowid,'total':total,'remaining_stock':p['stock']-o.quantity,'status':'completed','replayed':False}
+        total_cents=p['price_cents']*o.quantity
+        total=total_cents/100
+        cur=c.execute('INSERT INTO orders(product_id,quantity,total,total_cents,idempotency_key) VALUES(?,?,?,?,?)',(o.product_id,o.quantity,total,total_cents,o.idempotency_key))
+        return {'order_id':cur.lastrowid,'total':total,'total_cents':total_cents,'remaining_stock':p['stock']-o.quantity,'status':'completed','replayed':False}
 @app.get('/api/summary')
 def summary():
-    with db() as c:return [{'label':'Products','value':c.execute('SELECT COUNT(*) FROM products').fetchone()[0]},{'label':'Orders','value':c.execute('SELECT COUNT(*) FROM orders').fetchone()[0]},{'label':'Revenue','value':round(c.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE status='completed'").fetchone()[0],2)}]
+    with db() as c:return [{'label':'Products','value':c.execute('SELECT COUNT(*) FROM products').fetchone()[0]},{'label':'Orders','value':c.execute('SELECT COUNT(*) FROM orders').fetchone()[0]},{'label':'Revenue','value':c.execute("SELECT COALESCE(SUM(total_cents),0) FROM orders WHERE status='completed'").fetchone()[0]/100}]
 
 
 # v0.3: order lifecycle and inventory replenishment
@@ -105,7 +115,7 @@ def order_history(limit: int = 50):
         raise HTTPException(422, 'Limit must be between 1 and 200')
     with db() as con:
         return rows(con.execute("""SELECT o.id, o.product_id, p.name AS product,
-            o.quantity, o.total, o.created_at, o.status FROM orders o
+            o.quantity, o.total, o.total_cents, o.created_at, o.status FROM orders o
             JOIN products p ON p.id=o.product_id ORDER BY o.id DESC LIMIT ?""",(limit,)))
 
 
